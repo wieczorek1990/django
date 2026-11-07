@@ -84,13 +84,25 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             column_db_type, params, model, field, field_db_params, include_default
         )
 
-    def delete_model(self, model, *args, **kwargs):
+    def prepare_default(self, value):
+        return self.quote_value(value)
+
+    def delete_model(self, model, handle_autom2m=True):
         """Drop sequences when deleting a model."""
-        for field in model._meta.local_concrete_fields:
-            if self._is_auto(field):
-                seq_name = self._sequence_name(model._meta.db_table, field.column)
-                self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(seq_name)}")
-        super().delete_model(model, *args, **kwargs)
+        if handle_autom2m:
+            for field in model._meta.local_concrete_fields:
+                if self._is_auto(field):
+                    seq_name = self._sequence_name(model._meta.db_table, field.column)
+                    self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(seq_name)}")
+            super().delete_model(model)
+        else:
+            self.execute(f"DROP TABLE {self.quote_name(model._meta.db_table)}")
+            # Remove all deferred statements referencing the deleted table.
+            for sql in list(self.deferred_sql):
+                if isinstance(sql, Statement) and sql.references_table(
+                    model._meta.db_table
+                ):
+                    self.deferred_sql.remove(sql)
 
     def add_field(self, model, field):
         """Add a field to a model.
@@ -103,18 +115,30 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             self.create_model(field.remote_field.through)
             return
 
-        # If the field has a FK constraint, we need to recreate the table
-        if field.remote_field and field.db_constraint:
-            self._remake_table(model, create_field=field)
-            return
-
-        # If NOT NULL without default, need to recreate
-        if not field.null and self.effective_default(field) is None:
+        # If primary key, unique, not null, or FK constraint, need to recreate
+        if (
+            field.primary_key
+            or field.unique
+            or not field.null
+            or (field.remote_field and field.db_constraint)
+            or self.effective_default(field) is not None
+        ):
             self._remake_table(model, create_field=field)
             return
 
         # Otherwise use the standard path
         super().add_field(model, field)
+
+    def remove_field(self, model, field):
+        """Remove a field from a model."""
+        # M2M fields are a special case
+        if field.many_to_many:
+            if field.remote_field.through._meta.auto_created:
+                self.delete_model(field.remote_field.through)
+        else:
+            if field.db_parameters(connection=self.connection)["type"] is None:
+                return
+            self._remake_table(model, delete_field=field)
 
     def _alter_field(
         self,
@@ -127,36 +151,8 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         new_db_params,
         strict=False,
     ):
-        """Defer to table remake only for ALTERs DuckDB cannot perform."""
-
-        old_fks = (old_field.remote_field is not None and old_field.db_constraint) or (
-            new_field.remote_field is not None and new_field.db_constraint
-        )
-
-        old_internal = old_field.get_internal_type()
-        new_internal = new_field.get_internal_type()
-        auto_involved = {"AutoField", "BigAutoField", "SmallAutoField"}
-        unsupported = (
-            old_internal in auto_involved
-            or new_internal in auto_involved
-            or old_fks
-            or (old_field.null and not new_field.null)
-        )
-
-        if unsupported:
-            self._remake_table(model, alter_fields=[(old_field, new_field)])
-            return
-
-        super()._alter_field(
-            model,
-            old_field,
-            new_field,
-            old_type,
-            new_type,
-            old_db_params,
-            new_db_params,
-            strict,
-        )
+        """Perform a field update by remaking the table."""
+        self._remake_table(model, alter_fields=[(old_field, new_field)])
 
     def _remake_table(
         self, model, create_field=None, delete_field=None, alter_fields=None
@@ -166,46 +162,101 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         DuckDB doesn't support many ALTER TABLE operations, so we need to
         recreate the table: create a new table, copy data, drop old, rename new.
         """
-        alter_fields = alter_fields or []
+        def is_self_referential(f):
+            return f.is_relation and f.remote_field.model is model
 
         # Build the new fields dict
-        body = {f.name: f.clone() for f in model._meta.local_concrete_fields}
+        body = {
+            f.name: f.clone() if is_self_referential(f) else f
+            for f in model._meta.local_concrete_fields
+        }
 
         # Mapping for data copy
         mapping = {
             f.column: self.quote_name(f.column)
             for f in model._meta.local_concrete_fields
+            if getattr(f, "generated", False) is False
         }
+        rename_mapping = {}
+        restore_pk_field = None
+        alter_fields = alter_fields or []
+
+        if getattr(create_field, "primary_key", False) or any(
+            getattr(new_f, "primary_key", False) for _, new_f in alter_fields
+        ):
+            for name, field in list(body.items()):
+                if field.primary_key and not any(
+                    name == new_f.name for _, new_f in alter_fields
+                ):
+                    field.primary_key = False
+                    restore_pk_field = field
+                    if field.auto_created:
+                        del body[name]
+                        del mapping[field.column]
 
         # Add created field
         if create_field:
             body[create_field.name] = create_field
             if (
                 not create_field.has_db_default()
-                and not create_field.generated
+                and not getattr(create_field, "generated", False)
                 and create_field.concrete
             ):
                 mapping[create_field.column] = self.prepare_default(
                     self.effective_default(create_field)
                 )
 
-        # Remove deleted field
-        if delete_field:
-            body.pop(delete_field.name, None)
-            mapping.pop(delete_field.column, None)
-
         # Handle altered fields
         for old_field, new_field in alter_fields:
             body.pop(old_field.name, None)
             mapping.pop(old_field.column, None)
             body[new_field.name] = new_field
-            mapping[new_field.column] = self.quote_name(old_field.column)
+            rename_mapping[old_field.name] = new_field.name
+            if getattr(new_field, "generated", False):
+                continue
+            if old_field.null and not new_field.null:
+                if not new_field.has_db_default():
+                    default = self.prepare_default(self.effective_default(new_field))
+                else:
+                    default, _ = self.db_default_sql(new_field)
+                case_sql = "coalesce(%(col)s, %(default)s)" % {
+                    "col": self.quote_name(old_field.column),
+                    "default": default,
+                }
+                mapping[new_field.column] = case_sql
+            else:
+                mapping[new_field.column] = self.quote_name(old_field.column)
             if old_field.column != new_field.column and self._is_auto(new_field):
                 old_seq = self._sequence_name(model._meta.db_table, old_field.column)
                 self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(old_seq)}")
 
+        # Remove deleted field
+        if delete_field:
+            body.pop(delete_field.name, None)
+            mapping.pop(delete_field.column, None)
+            if self._is_auto(delete_field):
+                seq = self._sequence_name(model._meta.db_table, delete_field.column)
+                self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(seq)}")
+            if (
+                delete_field.many_to_many
+                and delete_field.remote_field.through._meta.auto_created
+            ):
+                return self.delete_model(delete_field.remote_field.through)
+
         # Work inside a new app registry
         apps = Apps()
+
+        # Work out unique_together, indexes, constraints
+        unique_together = [
+            [rename_mapping.get(n, n) for n in unique]
+            for unique in model._meta.unique_together
+        ]
+        indexes = list(model._meta.indexes)
+        if delete_field:
+            indexes = [
+                index for index in indexes if delete_field.name not in index.fields
+            ]
+        constraints = list(model._meta.constraints)
 
         # Register related models that FK fields point to, so they can be resolved
         for field in model._meta.local_concrete_fields:
@@ -237,9 +288,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         meta_contents = {
             "app_label": model._meta.app_label,
             "db_table": model._meta.db_table,
-            "unique_together": model._meta.unique_together,
-            "indexes": model._meta.indexes,
-            "constraints": model._meta.constraints,
+            "unique_together": unique_together,
+            "indexes": indexes,
+            "constraints": constraints,
             "apps": apps,
         }
         meta = type("Meta", (), meta_contents)
@@ -252,9 +303,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         meta_contents = {
             "app_label": model._meta.app_label,
             "db_table": "new__%s" % strip_quotes(model._meta.db_table),
-            "unique_together": model._meta.unique_together,
-            "indexes": model._meta.indexes,
-            "constraints": model._meta.constraints,
+            "unique_together": unique_together,
+            "indexes": indexes,
+            "constraints": constraints,
             "apps": apps,
         }
         meta = type("Meta", (), meta_contents)
@@ -276,10 +327,14 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             )
         )
 
-        auto_fields = [field for field in body.values() if self._is_auto(field)]
+        auto_fields = [
+            field
+            for field in new_model._meta.local_concrete_fields
+            if self._is_auto(field)
+        ]
 
-        # Drop the old table
-        self.execute(f"DROP TABLE {self.quote_name(model._meta.db_table)}")
+        # Delete the old table to make way for the new
+        self.delete_model(model, handle_autom2m=False)
 
         # Recreate auto-field sequences after copying explicit primary keys.
         for field in auto_fields:
@@ -306,29 +361,45 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 f"nextval('{self.quote_name(seq)}')"
             )
 
-        # Rename the new table
-        self.execute(
-            f"ALTER TABLE {self.quote_name(new_model._meta.db_table)} "
-            f"RENAME TO {self.quote_name(model._meta.db_table)}"
+        # Rename the new table to the original table name
+        super().alter_db_table(
+            new_model,
+            new_model._meta.db_table,
+            model._meta.db_table,
         )
 
-        # Clear deferred SQL that references the temporary table
-        self.deferred_sql = [
-            s
-            for s in self.deferred_sql
-            if new_model._meta.db_table not in str(getattr(s, "template", ""))
-        ]
+        # Run deferred SQL on correct table
+        for sql in self.deferred_sql:
+            if (
+                isinstance(sql, Statement)
+                and sql.template
+                and "FOREIGN KEY" in sql.template
+            ):
+                continue
+            self.execute(sql)
+        self.deferred_sql = []
+
+        if restore_pk_field:
+            restore_pk_field.primary_key = True
 
     def alter_db_table(
-        self, model, old_db_table, new_db_table, old_fields=None, fields=None
+        self, model, old_db_table, new_db_table
     ):
-        super().alter_db_table(model, old_db_table, new_db_table, old_fields, fields)
-        if fields is not None:
-            for field in fields:
-                if self._is_auto(field):
-                    old_seq = self._sequence_name(old_db_table, field.column)
-                    new_seq = self._sequence_name(new_db_table, field.column)
-                    self.execute(
-                        f"ALTER SEQUENCE {self.quote_name(old_seq)} "
-                        f"RENAME TO {self.quote_name(new_seq)}"
+        super().alter_db_table(model, old_db_table, new_db_table)
+        for field in model._meta.local_concrete_fields:
+            if self._is_auto(field):
+                old_seq = self._sequence_name(old_db_table, field.column)
+                new_seq = self._sequence_name(new_db_table, field.column)
+                with self.connection.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT COALESCE(MAX({self.quote_name(field.column)}), 0) + 1 "
+                        f"FROM {self.quote_name(new_db_table)}"
                     )
+                    next_val = cursor.fetchone()[0]
+                self.execute(f"CREATE SEQUENCE IF NOT EXISTS {self.quote_name(new_seq)} START WITH {next_val}")
+                self.execute(
+                    f"ALTER TABLE {self.quote_name(new_db_table)} "
+                    f"ALTER COLUMN {self.quote_name(field.column)} SET DEFAULT "
+                    f"nextval('{self.quote_name(new_seq)}')"
+                )
+                self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(old_seq)}")

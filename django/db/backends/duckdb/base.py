@@ -8,6 +8,9 @@ from collections.abc import Mapping
 
 import duckdb
 
+if not hasattr(duckdb, "Binary"):
+    duckdb.Binary = bytes
+
 from django.db import InterfaceError, OperationalError
 from django.db.backends.base.base import BaseDatabaseWrapper
 from django.utils.asyncio import async_unsafe
