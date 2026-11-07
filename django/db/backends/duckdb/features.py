@@ -6,6 +6,7 @@ from django.db.backends.base.features import BaseDatabaseFeatures
 
 
 class DatabaseFeatures(BaseDatabaseFeatures):
+    # Supporting versions >= 2.0
     minimum_database_version = (2, 0)
     test_db_allows_multiple_connections = True
     supports_unspecified_pk = False
@@ -19,7 +20,7 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     supports_temporal_subtraction = True
     ignores_table_name_case = False
     supports_cast_with_precision = True
-    can_release_savepoints = True
+    can_release_savepoints = False
     has_case_insensitive_like = True
     supports_parentheses_in_compound = True
     can_defer_constraint_checks = False
@@ -63,17 +64,16 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     supports_partial_indexes = True
     supports_nulls_distinct_unique_constraints = True
     supports_index_on_expression = True
-    supports_sequence_reset = False
+    supports_sequence_reset = True
     can_rename_columns = True
     can_rename_columns_atomic = True
     can_rename_index = True
     schema_editor_uses_db_defaults = True
     supports_bare_select_union = True
-    supports_deferrable_unique_constraints = False
     test_collations = {
         "virtual": "unicode",
     }
     test_collations_with_casing = {
         "virtual": "unicode",
     }
-    insert_test_table_with_defaults = 'INSERT INTO {} DEFAULT VALUES'
+    insert_test_table_with_defaults = "INSERT INTO {} DEFAULT VALUES"

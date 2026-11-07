@@ -11,9 +11,7 @@ from django.db.backends.utils import strip_quotes
 
 
 class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
-    sql_create_column_inline_fk = (
-        "REFERENCES %(to_table)s (%(to_column)s)%(on_delete)s"
-    )
+    sql_create_column_inline_fk = "REFERENCES %(to_table)s (%(to_column)s)%(on_delete)s"
     sql_create_unique = "CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)"
     sql_delete_unique = "DROP INDEX IF EXISTS %(name)s"
     sql_alter_table_comment = None
@@ -38,40 +36,49 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         if exc_type is None:
             for sql in self.deferred_sql:
                 # Skip deferred FK creation — DuckDB doesn't support ALTER TABLE ADD CONSTRAINT FK
-                if isinstance(sql, Statement) and sql.template and "FOREIGN KEY" in sql.template:
+                if (
+                    isinstance(sql, Statement)
+                    and sql.template
+                    and "FOREIGN KEY" in sql.template
+                ):
                     continue
                 self.execute(sql, None)
         if self.atomic_migration:
             self.atomic.__exit__(exc_type, exc_value, traceback)
 
+    @staticmethod
+    def _sequence_name(db_table, column):
+        # Must stay in sync with introspection if you implement get_sequences()
+        return f"seq_{db_table}_{column}"
+
+    def _is_auto(self, field):
+        return field.get_internal_type() in (
+            "AutoField",
+            "BigAutoField",
+            "SmallAutoField",
+        )
+
     def table_sql(self, model, *args, **kwargs):
         """Create sequences for AutoFields before creating the table."""
-        # Create sequences for auto fields
         for field in model._meta.local_concrete_fields:
-            internal_type = field.get_internal_type()
-            if internal_type in ("AutoField", "BigAutoField", "SmallAutoField"):
-                seq_name = f"seq_{model._meta.db_table}_{field.column}"
-                self.execute(f"CREATE SEQUENCE IF NOT EXISTS {self.quote_name(seq_name)}")
-                # Store sequence name on the field for column_sql to use
-                field._duckdb_sequence = seq_name
+            if self._is_auto(field):
+                seq_name = self._sequence_name(model._meta.db_table, field.column)
+                self.execute(
+                    f"CREATE SEQUENCE IF NOT EXISTS {self.quote_name(seq_name)}"
+                )
         return super().table_sql(model, *args, **kwargs)
 
     def _iter_column_sql(
         self, column_db_type, params, model, field, field_db_params, include_default
     ):
         """Override to handle DuckDB auto-increment via sequences."""
-        internal_type = field.get_internal_type()
-        is_auto = internal_type in ("AutoField", "BigAutoField", "SmallAutoField")
-
-        if is_auto:
-            # Use sequence-based auto-increment for DuckDB
-            seq_name = getattr(field, "_duckdb_sequence", None)
-            if seq_name:
-                yield column_db_type
-                yield f"DEFAULT nextval('{seq_name}')"
-                if field.primary_key:
-                    yield "PRIMARY KEY"
-                return
+        if self._is_auto(field):
+            seq_name = self._sequence_name(model._meta.db_table, field.column)
+            yield column_db_type
+            yield f"DEFAULT nextval('{self.quote_name(seq_name)}')"
+            if field.primary_key:
+                yield "PRIMARY KEY"
+            return
 
         yield from super()._iter_column_sql(
             column_db_type, params, model, field, field_db_params, include_default
@@ -80,11 +87,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     def delete_model(self, model, *args, **kwargs):
         """Drop sequences when deleting a model."""
         for field in model._meta.local_concrete_fields:
-            internal_type = field.get_internal_type()
-            if internal_type in ("AutoField", "BigAutoField", "SmallAutoField"):
-                seq_name = getattr(field, "_duckdb_sequence", None)
-                if seq_name:
-                    self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(seq_name)}")
+            if self._is_auto(field):
+                seq_name = self._sequence_name(model._meta.db_table, field.column)
+                self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(seq_name)}")
         super().delete_model(model, *args, **kwargs)
 
     def add_field(self, model, field):
@@ -112,28 +117,50 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         super().add_field(model, field)
 
     def _alter_field(
-        self, model, old_field, new_field, old_type, new_type, old_db_params, new_db_params, strict=False
+        self,
+        model,
+        old_field,
+        new_field,
+        old_type,
+        new_type,
+        old_db_params,
+        new_db_params,
+        strict=False,
     ):
-        """Override to handle ALTER TABLE limitations in DuckDB.
+        """Defer to table remake only for ALTERs DuckDB cannot perform."""
 
-        DuckDB doesn't support ALTER TABLE when there are dependent entries.
-        We need to recreate the table instead.
-        """
-        # If only the column name changed, try the simple rename
-        if (
-            old_field.column != new_field.column
-            and self.column_sql(model, old_field) == self.column_sql(model, new_field)
-        ):
-            return self.execute(
-                self._rename_field_sql(
-                    model._meta.db_table, old_field, new_field, new_type
-                )
-            )
+        old_fks = (old_field.remote_field is not None and old_field.db_constraint) or (
+            new_field.remote_field is not None and new_field.db_constraint
+        )
 
-        # For any other change, recreate the table
-        self._remake_table(model, alter_fields=[(old_field, new_field)])
+        old_internal = old_field.get_internal_type()
+        new_internal = new_field.get_internal_type()
+        auto_involved = {"AutoField", "BigAutoField", "SmallAutoField"}
+        unsupported = (
+            old_internal in auto_involved
+            or new_internal in auto_involved
+            or old_fks
+            or (old_field.null and not new_field.null)
+        )
 
-    def _remake_table(self, model, create_field=None, delete_field=None, alter_fields=None):
+        if unsupported:
+            self._remake_table(model, alter_fields=[(old_field, new_field)])
+            return
+
+        super()._alter_field(
+            model,
+            old_field,
+            new_field,
+            old_type,
+            new_type,
+            old_db_params,
+            new_db_params,
+            strict,
+        )
+
+    def _remake_table(
+        self, model, create_field=None, delete_field=None, alter_fields=None
+    ):
         """Recreate a table with the updated schema.
 
         DuckDB doesn't support many ALTER TABLE operations, so we need to
@@ -142,10 +169,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         alter_fields = alter_fields or []
 
         # Build the new fields dict
-        body = {
-            f.name: f.clone()
-            for f in model._meta.local_concrete_fields
-        }
+        body = {f.name: f.clone() for f in model._meta.local_concrete_fields}
 
         # Mapping for data copy
         mapping = {
@@ -156,7 +180,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # Add created field
         if create_field:
             body[create_field.name] = create_field
-            if not create_field.has_db_default() and not create_field.generated and create_field.concrete:
+            if (
+                not create_field.has_db_default()
+                and not create_field.generated
+                and create_field.concrete
+            ):
                 mapping[create_field.column] = self.prepare_default(
                     self.effective_default(create_field)
                 )
@@ -172,6 +200,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             mapping.pop(old_field.column, None)
             body[new_field.name] = new_field
             mapping[new_field.column] = self.quote_name(old_field.column)
+            if old_field.column != new_field.column and self._is_auto(new_field):
+                old_seq = self._sequence_name(model._meta.db_table, old_field.column)
+                self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(old_seq)}")
 
         # Work inside a new app registry
         apps = Apps()
@@ -195,7 +226,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                         related_meta_obj = type("Meta", (), related_meta)
                         related_body["Meta"] = related_meta_obj
                         related_body["__module__"] = related_model.__module__
-                        type(related_model._meta.object_name, related_model.__bases__, related_body)
+                        type(
+                            related_model._meta.object_name,
+                            related_model.__bases__,
+                            related_body,
+                        )
 
         # Construct a model with the original table name for FK resolution
         body_copy = copy.deepcopy(body)
@@ -251,4 +286,22 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         )
 
         # Clear deferred SQL that references the temporary table
-        self.deferred_sql = []
+        self.deferred_sql = [
+            s
+            for s in self.deferred_sql
+            if new_model._meta.db_table not in str(getattr(s, "template", ""))
+        ]
+
+    def alter_db_table(
+        self, model, old_db_table, new_db_table, old_fields=None, fields=None
+    ):
+        super().alter_db_table(model, old_db_table, new_db_table, old_fields, fields)
+        if fields is not None:
+            for field in fields:
+                if self._is_auto(field):
+                    old_seq = self._sequence_name(old_db_table, field.column)
+                    new_seq = self._sequence_name(new_db_table, field.column)
+                    self.execute(
+                        f"ALTER SEQUENCE {self.quote_name(old_seq)} "
+                        f"RENAME TO {self.quote_name(new_seq)}"
+                    )

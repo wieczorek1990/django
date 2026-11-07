@@ -5,6 +5,7 @@ Database operations for DuckDB backend.
 import datetime
 import decimal
 import uuid
+from collections.abc import Mapping
 
 from django.conf import settings
 from django.db import DatabaseError
@@ -27,27 +28,36 @@ class DatabaseOperations(BaseDatabaseOperations):
         return f"EXTRACT({lookup_type.lower()} FROM {sql})", params
 
     def date_trunc_sql(self, lookup_type, sql, params, tzname=None):
-        return f"DATE_TRUNC({lookup_type.lower()}, {sql})", (lookup_type.lower(), *params)
+        return f"DATE_TRUNC('{lookup_type.lower()}', {sql})", params
 
     def time_trunc_sql(self, lookup_type, sql, params, tzname=None):
-        return f"TIME_TRUNC({lookup_type.lower()}, {sql})", (lookup_type.lower(), *params)
+        return f"TIME_TRUNC('{lookup_type.lower()}', {sql})", params
 
     def datetime_trunc_sql(self, lookup_type, sql, params, tzname=None):
-        return f"TIMESTAMP_TRUNC({lookup_type.lower()}, {sql})", (lookup_type.lower(), *params)
+        return f"TIMESTAMP_TRUNC('{lookup_type.lower()}', {sql})", params
 
     def pk_default_value(self):
         return "NULL"
 
     def last_executed_query(self, cursor, sql, params):
-        if params:
-            if isinstance(params, (list, tuple)):
-                params = tuple(repr(p) for p in params)
-                return sql % params
-            else:
-                values = tuple(repr(v) for v in params.values())
-                params = dict(zip(params, values))
-                return sql % params
-        return sql
+        if not params:
+            return sql
+
+        def _literal(v):
+            if v is None:
+                return "NULL"
+            if isinstance(v, bool):
+                return "1" if v else "0"
+            if isinstance(v, (int, float, decimal.Decimal)):
+                return str(v)
+            if isinstance(v, (bytes, bytearray, memoryview)):
+                return "X'%s'" % bytes(v).hex()
+            return "'%s'" % str(v).replace("'", "''")
+
+        if isinstance(params, Mapping):
+            values = {k: _literal(v) for k, v in params.items()}
+            return sql % values
+        return sql % tuple(_literal(p) for p in params)
 
     def quote_name(self, name):
         if name.startswith('"') and name.endswith('"'):
@@ -55,7 +65,7 @@ class DatabaseOperations(BaseDatabaseOperations):
         return '"%s"' % name
 
     def no_limit_value(self):
-        return ""
+        return None
 
     def sql_flush(self, style, tables, *, reset_sequences=False, allow_cascade=False):
         sql = [
@@ -68,12 +78,50 @@ class DatabaseOperations(BaseDatabaseOperations):
             for table in tables
         ]
         if reset_sequences and tables:
-            sql.extend(self.sequence_reset_by_name_sql(style, [{"table": t} for t in tables]))
+            sql.extend(
+                self.sequence_reset_by_name_sql(style, [{"table": t} for t in tables])
+            )
         return sql
 
     def sequence_reset_by_name_sql(self, style, sequences):
-        # DuckDB doesn't have sequences
-        return []
+        """
+        Reset sequences for the given tables.
+
+        Sequences are created by the schema editor for auto fields
+        (seq_<table>_<column>, see DatabaseSchemaEditor._sequence_name).
+        DuckDB has no sequence RESTART command, so drop and recreate each
+        sequence starting after the current MAX(pk).
+        """
+        sql = []
+        with self.connection.cursor() as cursor:
+            introspection = self.connection.introspection
+            existing = {
+                row[0]
+                for row in cursor.execute(
+                    "SELECT sequence_name FROM duckdb_sequences() "
+                    "WHERE schema_name = 'main'"
+                ).fetchall()
+            }
+            for sequence in sequences:
+                table = sequence["table"]
+                pk_columns = introspection.get_primary_key_columns(cursor, table)
+                if not pk_columns:
+                    continue
+                column = sequence.get("column") or pk_columns[0]
+                seq_name = f"seq_{table}_{column}"
+                if seq_name not in existing:
+                    continue
+                sql.append("DROP SEQUENCE IF EXISTS %s" % self.quote_name(seq_name))
+                sql.append(
+                    "CREATE SEQUENCE %s START WITH "
+                    "(SELECT COALESCE(MAX(%s), 0) + 1 FROM %s)"
+                    % (
+                        self.quote_name(seq_name),
+                        self.quote_name(column),
+                        self.quote_name(table),
+                    )
+                )
+        return sql
 
     def adapt_datetimefield_value(self, value):
         if value is None:
@@ -86,14 +134,14 @@ class DatabaseOperations(BaseDatabaseOperations):
                     "DuckDB backend does not support timezone-aware datetimes when "
                     "USE_TZ is False."
                 )
-        return str(value)
+        return value
 
     def adapt_timefield_value(self, value):
         if value is None:
             return None
         if timezone.is_aware(value):
             raise ValueError("DuckDB backend does not support timezone-aware times.")
-        return str(value)
+        return value
 
     def get_db_converters(self, expression):
         converters = super().get_db_converters(expression)

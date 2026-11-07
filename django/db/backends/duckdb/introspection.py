@@ -17,6 +17,7 @@ FieldInfo = namedtuple(
 
 class FlexibleFieldLookupDict:
     """Maps DuckDB SQL types to Django Field types."""
+
     base_data_types_reverse = {
         "BOOLEAN": "BooleanField",
         "TINYINT": "SmallIntegerField",
@@ -67,8 +68,8 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
     def get_table_list(self, cursor):
         """Return a list of table and view names in the current database."""
         cursor.execute("""
-            SELECT table_name, table_type 
-            FROM information_schema.tables 
+            SELECT table_name, table_type
+            FROM information_schema.tables
             WHERE table_schema = 'main'
             ORDER BY table_name
         """)
@@ -85,12 +86,15 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
 
     def get_table_description(self, cursor, table_name):
         """Return a description of the table with the DB-API cursor.description interface."""
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT column_name, data_type, is_nullable, column_default
             FROM information_schema.columns
             WHERE table_name = ? AND table_schema = 'main'
             ORDER BY ordinal_position
-        """, [table_name])
+        """,
+            [table_name],
+        )
         columns = cursor.fetchall()
         if not columns:
             raise DatabaseError(f"Table {table_name} does not exist (empty pragma).")
@@ -131,12 +135,35 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         return table_description
 
     def get_sequences(self, cursor, table_name, table_fields=()):
-        # DuckDB doesn't have sequences
-        return []
+        cursor.execute(
+            "SELECT sequence_name FROM duckdb_sequences() " "WHERE schema_name = 'main'"
+        )
+        existing = {row[0] for row in cursor.fetchall()}
+        sequences = []
+        for field in table_fields:
+            expected = f"seq_{table_name}_{field.column}"
+            if (
+                field.get_internal_type()
+                in (
+                    "AutoField",
+                    "BigAutoField",
+                    "SmallAutoField",
+                )
+                and expected in existing
+            ):
+                sequences.append(
+                    {
+                        "name": expected,
+                        "table": table_name,
+                        "column": field.column,
+                    }
+                )
+        return sequences
 
     def get_relations(self, cursor, table_name):
         """Return a dictionary of foreign key relations."""
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT
                 tc.constraint_name,
                 kcu.column_name,
@@ -148,6 +175,7 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
             JOIN information_schema.key_column_usage AS kcu
                 ON tc.constraint_name = kcu.constraint_name
                 AND tc.table_schema = kcu.table_schema
+                AND tc.table_name = kcu.table_name
             JOIN information_schema.constraint_column_usage AS ccu
                 ON ccu.constraint_name = tc.constraint_name
                 AND ccu.table_schema = tc.table_schema
@@ -157,7 +185,10 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
             WHERE tc.constraint_type = 'FOREIGN KEY'
                 AND tc.table_name = ?
                 AND tc.table_schema = 'main'
-        """, [table_name])
+                AND ccu.table_name <> tc.table_name
+        """,
+            [table_name],
+        )
 
         relations = {}
         for row in cursor.fetchall():
@@ -170,11 +201,20 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         return relations
 
     def get_primary_key_columns(self, cursor, table_name):
-        cursor.execute("""
-            SELECT column_name
-            FROM information_schema.key_column_usage
-            WHERE table_name = ? AND table_schema = 'main'
-        """, [table_name])
+        cursor.execute(
+            """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints AS tc
+            JOIN information_schema.key_column_usage AS kcu
+                ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
+                AND tc.table_name = kcu.table_name
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+                AND tc.table_name = ?
+                AND tc.table_schema = 'main'
+        """,
+            [table_name],
+        )
         return [row[0] for row in cursor.fetchall()]
 
     def get_constraints(self, cursor, table_name):
@@ -182,7 +222,8 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         constraints = {}
 
         # Get all constraints from information_schema
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT
                 tc.constraint_name,
                 tc.constraint_type,
@@ -191,9 +232,12 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
             JOIN information_schema.key_column_usage AS kcu
                 ON tc.constraint_name = kcu.constraint_name
                 AND tc.table_schema = kcu.table_schema
+                AND tc.table_name = kcu.table_name
             WHERE tc.table_name = ? AND tc.table_schema = 'main'
             ORDER BY tc.constraint_type, tc.constraint_name
-        """, [table_name])
+        """,
+            [table_name],
+        )
 
         constraint_rows = cursor.fetchall()
 
@@ -211,7 +255,8 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
             constraint_map[name]["columns"].append(column)
 
         # Get foreign key details
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT
                 tc.constraint_name,
                 kcu.column_name,
@@ -221,13 +266,17 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
             JOIN information_schema.key_column_usage AS kcu
                 ON tc.constraint_name = kcu.constraint_name
                 AND tc.table_schema = kcu.table_schema
+                AND tc.table_name = kcu.table_name
             JOIN information_schema.constraint_column_usage AS ccu
                 ON ccu.constraint_name = tc.constraint_name
                 AND ccu.table_schema = tc.table_schema
             WHERE tc.constraint_type = 'FOREIGN KEY'
                 AND tc.table_name = ?
                 AND tc.table_schema = 'main'
-        """, [table_name])
+                AND ccu.table_name <> tc.table_name
+        """,
+            [table_name],
+        )
 
         fk_map = {}
         for row in cursor.fetchall():
@@ -276,11 +325,14 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
                 }
 
         # Get indexes
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT index_name, tablename, index_columns
             FROM duckdb_indexes()
             WHERE schemaname = 'main' AND tablename = ?
-        """, [table_name])
+        """,
+            [table_name],
+        )
 
         for row in cursor.fetchall():
             index_name = row[0]

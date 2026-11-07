@@ -2,11 +2,13 @@
 DuckDB backend for Django.
 """
 
+import re
 from pathlib import Path
 from collections.abc import Mapping
 
 import duckdb
 
+from django.db import InterfaceError, OperationalError
 from django.db.backends.base.base import BaseDatabaseWrapper
 from django.utils.asyncio import async_unsafe
 
@@ -16,6 +18,8 @@ from .features import DatabaseFeatures
 from .introspection import DatabaseIntrospection
 from .operations import DatabaseOperations
 from .schema import DatabaseSchemaEditor
+
+_FORMAT_PLACEHOLDER_RE = re.compile(r"%(%|s|\(\w+\)s)")
 
 
 def _get_varchar_column(data):
@@ -77,7 +81,9 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         "iendswith": "ILIKE %s",
     }
 
-    pattern_esc = r"REPLACE(REPLACE(REPLACE({}, '\\', '\\\\'), '%%', '\\%%'), '_', '\\_')"
+    pattern_esc = (
+        r"REPLACE(REPLACE(REPLACE({}, '\\', '\\\\'), '%%', '\\%%'), '_', '\\_')"
+    )
     pattern_ops = {
         "contains": r"LIKE '%%' || {} || '%%'",
         "icontains": r"ILIKE '%%' || {} || '%%'",
@@ -88,11 +94,12 @@ class DatabaseWrapper(BaseDatabaseWrapper):
     }
 
     Database = duckdb
-    # DuckDB doesn't have InterfaceError; map it to OperationalError
-    # The wrap_database_errors context manager needs these exception classes
-    # on the Database module for proper error translation
-    if not hasattr(duckdb, 'InterfaceError'):
-        duckdb.InterfaceError = duckdb.OperationalError
+
+    @property
+    def database_errors(self):
+        errors = super().database_errors
+        return tuple(e for e in errors if e is not InterfaceError) or errors
+
     SchemaEditorClass = DatabaseSchemaEditor
     client_class = DatabaseClient
     creation_class = DatabaseCreation
@@ -122,7 +129,9 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             try:
                 Path(database).parent.mkdir(exist_ok=True, parents=True)
             except OSError as e:
-                raise duckdb.OperationalError(f"Error creating path to DuckDB database: {e}.")
+                raise duckdb.OperationalError(
+                    f"Error creating path to DuckDB database: {e}."
+                )
         conn = self.Database.connect(**conn_params)
         # DuckDB autocommit is ON by default, which is what Django expects
         return conn
@@ -194,76 +203,25 @@ class DuckDBCursorWrapper:
 
     def execute(self, query, params=None):
         if params is None:
-            return self.cursor.execute(query)
-        # Convert pyformat style (%(name)s) to named parameters
-        # DuckDB doesn't support named params, so we use positional
+            return self.cursor.execute(self.convert_query(query))
         if isinstance(params, Mapping):
-            param_names = list(params)
-            query = self.convert_query(query, param_names=param_names)
             params = list(params.values())
-        else:
-            query = self.convert_query(query)
-        return self.cursor.execute(query, params)
+        return self.cursor.execute(self.convert_query(query), params)
 
     def executemany(self, query, param_list):
+        param_list = list(param_list)
         if not param_list:
             return
-        iterator = iter(param_list)
-        first = next(iterator, None)
-        if first is None:
-            return
-        if isinstance(first, Mapping):
-            param_names = list(first)
-            query = self.convert_query(query, param_names=param_names)
-            param_list = [list(p.values()) for p in iterator]
-            # Don't forget the first item
-            param_list = [list(first.values())] + param_list
-        else:
-            query = self.convert_query(query)
-            param_list = [first] + list(iterator)
-        return self.cursor.executemany(query, param_list)
+        if isinstance(param_list[0], Mapping):
+            param_list = [list(p.values()) for p in param_list]
+        return self.cursor.executemany(self.convert_query(query), param_list)
 
-    def convert_query(self, query, param_names=None):
-        if param_names is None:
-            # Convert %s to ? (but not %% which is a literal %)
-            # We need to handle %%s carefully
-            result = []
-        else:
-            # Convert %(name)s to ?
-            result = []
-
-        if param_names is None:
-            # Simple %s -> ? conversion
-            i = 0
-            while i < len(query):
-                if i < len(query) - 1 and query[i] == "%" and query[i + 1] == "%":
-                    result.append("%")
-                    i += 2
-                elif i < len(query) - 1 and query[i] == "%" and query[i + 1] == "s":
-                    result.append("?")
-                    i += 2
-                else:
-                    result.append(query[i])
-                    i += 1
-            return "".join(result)
-        else:
-            # Convert %(name)s to ?
-            for name in param_names:
-                query = query.replace("%(" + name + ")s", "?", 1)
-            # Also handle any remaining %s
-            i = 0
-            converted = []
-            while i < len(query):
-                if i < len(query) - 1 and query[i] == "%" and query[i + 1] == "%":
-                    converted.append("%")
-                    i += 2
-                elif i < len(query) - 1 and query[i] == "%" and query[i + 1] == "s":
-                    converted.append("?")
-                    i += 2
-                else:
-                    converted.append(query[i])
-                    i += 1
-            return "".join(converted)
+    def convert_query(self, query):
+        """Convert Django's format/pyformat placeholders to DuckDB's '?'."""
+        return _FORMAT_PLACEHOLDER_RE.sub(
+            lambda m: "%" if m.group(1) == "%" else "?",
+            query,
+        )
 
     def fetchone(self):
         return self.cursor.fetchone()
