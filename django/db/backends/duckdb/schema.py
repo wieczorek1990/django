@@ -3,6 +3,9 @@ Schema editor for DuckDB backend.
 """
 
 import copy
+import datetime
+import decimal
+import uuid
 
 from django.apps.registry import Apps
 from django.db.backends.base.schema import BaseDatabaseSchemaEditor
@@ -29,6 +32,17 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             return "NULL"
         elif isinstance(value, (bytes, bytearray, memoryview)):
             return "X'%s'" % value.hex()
+        elif isinstance(value, decimal.Decimal):
+            return str(value)
+        elif isinstance(value, datetime.timedelta):
+            total_microseconds = (
+                (value.days * 86400 + value.seconds) * 1000000 + value.microseconds
+            )
+            return "INTERVAL '%s microseconds'" % total_microseconds
+        elif isinstance(
+            value, (datetime.datetime, datetime.date, datetime.time, uuid.UUID)
+        ):
+            return "'%s'" % str(value).replace("'", "''")
         else:
             return str(value)
 
@@ -385,6 +399,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     def alter_db_table(
         self, model, old_db_table, new_db_table
     ):
+        if old_db_table == new_db_table or (
+            self.connection.features.ignores_table_name_case
+            and old_db_table.lower() == new_db_table.lower()
+        ):
+            return
         super().alter_db_table(model, old_db_table, new_db_table)
         for field in model._meta.local_concrete_fields:
             if self._is_auto(field):
@@ -396,7 +415,10 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                         f"FROM {self.quote_name(new_db_table)}"
                     )
                     next_val = cursor.fetchone()[0]
-                self.execute(f"CREATE SEQUENCE IF NOT EXISTS {self.quote_name(new_seq)} START WITH {next_val}")
+                self.execute(
+                    f"CREATE SEQUENCE IF NOT EXISTS {self.quote_name(new_seq)} "
+                    f"START WITH {next_val}"
+                )
                 self.execute(
                     f"ALTER TABLE {self.quote_name(new_db_table)} "
                     f"ALTER COLUMN {self.quote_name(field.column)} SET DEFAULT "
