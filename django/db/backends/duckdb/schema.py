@@ -276,8 +276,35 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             )
         )
 
+        auto_fields = [field for field in body.values() if self._is_auto(field)]
+
         # Drop the old table
         self.execute(f"DROP TABLE {self.quote_name(model._meta.db_table)}")
+
+        # Recreate auto-field sequences after copying explicit primary keys.
+        for field in auto_fields:
+            temp_seq = self._sequence_name(new_model._meta.db_table, field.column)
+            seq = self._sequence_name(model._meta.db_table, field.column)
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT COALESCE(MAX({self.quote_name(field.column)}), 0) + 1 "
+                    f"FROM {self.quote_name(new_model._meta.db_table)}"
+                )
+                next_value = cursor.fetchone()[0]
+            self.execute(
+                f"ALTER TABLE {self.quote_name(new_model._meta.db_table)} "
+                f"ALTER COLUMN {self.quote_name(field.column)} DROP DEFAULT"
+            )
+            self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(temp_seq)}")
+            self.execute(f"DROP SEQUENCE IF EXISTS {self.quote_name(seq)}")
+            self.execute(
+                f"CREATE SEQUENCE {self.quote_name(seq)} START WITH {next_value}"
+            )
+            self.execute(
+                f"ALTER TABLE {self.quote_name(new_model._meta.db_table)} "
+                f"ALTER COLUMN {self.quote_name(field.column)} SET DEFAULT "
+                f"nextval('{self.quote_name(seq)}')"
+            )
 
         # Rename the new table
         self.execute(
